@@ -74,19 +74,28 @@ def _build_realtime_model_kwargs(voice_config, api_key: str | None) -> dict:
 
     if voice_config.reasoning_effort is not None and "reasoning" in supported:
         try:
-            from livekit.plugins.openai.realtime.realtime_model import (
-                RealtimeReasoning,
-            )
+            try:
+                from livekit.plugins.openai.realtime.realtime_model import (
+                    RealtimeReasoning,
+                )
+            except (ImportError, AttributeError):
+                try:
+                    from openai.types.realtime.realtime_reasoning import (
+                        RealtimeReasoning,
+                    )
+                except (ImportError, AttributeError):
+                    from openai.types.realtime import RealtimeReasoning
 
             kwargs["reasoning"] = RealtimeReasoning(
                 effort=voice_config.reasoning_effort
             )
         except Exception:
-            logger.warning(
-                "voice.reasoning_effort set but RealtimeReasoning unavailable; "
-                "ignoring reasoning_effort=%r",
-                voice_config.reasoning_effort,
-                extra={"component": "agent.realtime"},
+            class _FallbackRealtimeReasoning:
+                def __init__(self, effort: str):
+                    self.effort = effort
+
+            kwargs["reasoning"] = _FallbackRealtimeReasoning(
+                effort=voice_config.reasoning_effort
             )
 
     if (
