@@ -1,0 +1,976 @@
+# tests/test_agent_helpers.py
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
+import pytest
+from livekit import rtc
+
+from receptionist.agent import (
+    _capture_caller_phone_from_participant,
+    _get_caller_identity,
+    _get_caller_phone,
+    _get_sip_participant_phone,
+    _is_benign_engine_closed_warning,
+    _refresh_realtime_tools,
+    _resolve_agent_name,
+    _resolve_relative_date,
+)
+import receptionist.agent as agent_module
+from receptionist.lifecycle import CallLifecycle
+
+
+@pytest.fixture
+def sun_apr_26_2026():
+    """A Sunday for predictable weekday math in the resolver tests."""
+    return datetime(2026, 4, 26, 10, 30, tzinfo=ZoneInfo("America/New_York"))
+
+
+def test_resolve_today(sun_apr_26_2026):
+    assert _resolve_relative_date("today", sun_apr_26_2026) == "April 26 2026"
+
+
+def test_resolve_tonight_aliases_today(sun_apr_26_2026):
+    assert _resolve_relative_date("tonight", sun_apr_26_2026) == "April 26 2026"
+
+
+def test_resolve_tomorrow(sun_apr_26_2026):
+    assert _resolve_relative_date("tomorrow", sun_apr_26_2026) == "April 27 2026"
+
+
+def test_resolve_this_weekday_uses_soonest_occurrence(sun_apr_26_2026):
+    """'This Friday' on a Sunday is the upcoming Friday (5 days out)."""
+    assert _resolve_relative_date("this Friday", sun_apr_26_2026) == "May 01 2026"
+
+
+def test_resolve_this_weekday_today_returns_today(sun_apr_26_2026):
+    """'This Sunday' on a Sunday is today."""
+    assert _resolve_relative_date("this Sunday", sun_apr_26_2026) == "April 26 2026"
+
+
+def test_resolve_next_weekday_jumps_a_week(sun_apr_26_2026):
+    """'Next Monday' is at least 7 days out — never tomorrow."""
+    assert _resolve_relative_date("next Monday", sun_apr_26_2026) == "May 04 2026"
+
+
+def test_resolve_next_weekday_when_today_is_target(sun_apr_26_2026):
+    """'Next Sunday' on a Sunday means 7 days from now, not today."""
+    assert _resolve_relative_date("next Sunday", sun_apr_26_2026) == "May 03 2026"
+
+
+def test_resolve_passthrough_for_absolute_dates(sun_apr_26_2026):
+    """Absolute dates fall through unchanged for dateutil to parse."""
+    assert _resolve_relative_date("April 28", sun_apr_26_2026) == "April 28"
+
+
+def test_resolve_passthrough_for_bare_weekday(sun_apr_26_2026):
+    """Bare weekday names fall through — dateutil handles them."""
+    assert _resolve_relative_date("Monday", sun_apr_26_2026) == "Monday"
+
+
+def test_resolve_case_insensitive(sun_apr_26_2026):
+    assert _resolve_relative_date("TOMORROW", sun_apr_26_2026) == "April 27 2026"
+    assert _resolve_relative_date("Next Monday", sun_apr_26_2026) == "May 04 2026"
+
+
+def _participant(kind, attrs=None, identity=""):
+    return SimpleNamespace(kind=kind, attributes=attrs or {}, identity=identity)
+
+
+def test_resolve_agent_name_defaults_to_production_name(monkeypatch):
+    monkeypatch.delenv("RECEPTIONIST_AGENT_NAME", raising=False)
+    assert _resolve_agent_name() == "receptionist"
+
+
+def test_resolve_agent_name_allows_blank_for_dev_wildcard(monkeypatch):
+    monkeypatch.setenv("RECEPTIONIST_AGENT_NAME", "")
+    assert _resolve_agent_name() == ""
+
+
+def test_resolve_agent_name_allows_custom_name(monkeypatch):
+    monkeypatch.setenv("RECEPTIONIST_AGENT_NAME", "night-shift")
+    assert _resolve_agent_name() == "night-shift"
+
+
+def test_agent_generation_guard_is_valid_when_env_missing(monkeypatch):
+    monkeypatch.delenv("RECEPTIONIST_AGENT_GENERATION", raising=False)
+    monkeypatch.delenv("RECEPTIONIST_AGENT_GENERATION_FILE", raising=False)
+
+    matches = getattr(agent_module, "_agent_generation_matches_file", lambda: None)
+
+    assert matches() is True
+
+
+def test_agent_generation_guard_matches_file_value(monkeypatch, tmp_path):
+    generation_file = tmp_path / "generation.txt"
+    generation_file.write_text("42\n", encoding="utf-8")
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION", "42")
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION_FILE", str(generation_file))
+
+    matches = getattr(agent_module, "_agent_generation_matches_file", lambda: None)
+
+    assert matches() is True
+
+
+def test_agent_generation_guard_detects_changed_file(monkeypatch, tmp_path):
+    generation_file = tmp_path / "generation.txt"
+    generation_file.write_text("43\n", encoding="utf-8")
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION", "42")
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION_FILE", str(generation_file))
+
+    matches = getattr(agent_module, "_agent_generation_matches_file", lambda: None)
+
+    assert matches() is False
+
+
+def test_agent_generation_guard_detects_missing_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION", "42")
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION_FILE", str(tmp_path / "missing.txt"))
+
+    matches = getattr(agent_module, "_agent_generation_matches_file", lambda: None)
+
+    assert matches() is False
+
+
+def test_start_generation_watchdog_is_disabled_without_env(monkeypatch):
+    monkeypatch.delenv("RECEPTIONIST_AGENT_GENERATION", raising=False)
+    monkeypatch.delenv("RECEPTIONIST_AGENT_GENERATION_FILE", raising=False)
+
+    start = getattr(agent_module, "_start_generation_watchdog_once", lambda **kwargs: "started")
+
+    assert start() is None
+
+
+def test_start_generation_watchdog_uses_thread_without_running_event_loop(monkeypatch, tmp_path):
+    generation_file = tmp_path / "generation.txt"
+    generation_file.write_text("42\n", encoding="utf-8")
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION", "42")
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION_FILE", str(generation_file))
+    monkeypatch.setattr(agent_module, "_GENERATION_WATCHDOG_THREAD", None, raising=False)
+    created = {}
+
+    class FakeThread:
+        def __init__(self, *, target, name, daemon):
+            created["target"] = target
+            created["name"] = name
+            created["daemon"] = daemon
+            self.started = False
+
+        def is_alive(self):
+            return self.started
+
+        def start(self):
+            self.started = True
+            created["started"] = True
+
+    thread = agent_module._start_generation_watchdog_once(thread_factory=FakeThread)
+
+    assert thread is not None
+    assert created["name"] == "receptionist-generation-watchdog"
+    assert created["daemon"] is True
+    assert created["started"] is True
+
+
+def test_start_generation_watchdog_exits_before_thread_when_generation_is_stale(
+    monkeypatch, tmp_path
+):
+    generation_file = tmp_path / "generation.txt"
+    generation_file.write_text("43\n", encoding="utf-8")
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION", "42")
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION_FILE", str(generation_file))
+    monkeypatch.setattr(agent_module, "_GENERATION_WATCHDOG_THREAD", None, raising=False)
+    exit_codes: list[int] = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            raise AssertionError("stale generation should exit before thread start")
+
+    thread = agent_module._start_generation_watchdog_once(
+        thread_factory=FakeThread,
+        exit_process=exit_codes.append,
+    )
+
+    assert thread is None
+    assert exit_codes == [0]
+
+
+def test_run_agent_cli_starts_generation_watchdog_before_livekit_cli(monkeypatch):
+    calls: list[str] = []
+
+    def fake_start_watchdog():
+        calls.append("watchdog")
+
+    def fake_run_app(server):
+        calls.append("run_app")
+        assert server is agent_module.server
+
+    monkeypatch.setattr(agent_module, "_start_generation_watchdog_once", fake_start_watchdog)
+    monkeypatch.setattr(agent_module.agents.cli, "run_app", fake_run_app)
+
+    agent_module._run_agent_cli()
+
+    assert calls == ["watchdog", "run_app"]
+
+
+def test_generation_watchdog_check_exits_when_generation_file_changes(monkeypatch, tmp_path):
+    generation_file = tmp_path / "generation.txt"
+    generation_file.write_text("43\n", encoding="utf-8")
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION", "42")
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION_FILE", str(generation_file))
+    exit_codes: list[int] = []
+    check_once = getattr(
+        agent_module,
+        "_check_generation_watchdog_once",
+        lambda **kwargs: False,
+    )
+
+    assert check_once(exit_process=exit_codes.append) is True
+    assert exit_codes == [0]
+
+
+def test_generation_watchdog_check_exits_when_generation_file_disappears(monkeypatch, tmp_path):
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION", "42")
+    monkeypatch.setenv("RECEPTIONIST_AGENT_GENERATION_FILE", str(tmp_path / "missing.txt"))
+    exit_codes: list[int] = []
+    check_once = getattr(
+        agent_module,
+        "_check_generation_watchdog_once",
+        lambda **kwargs: False,
+    )
+
+    assert check_once(exit_process=exit_codes.append) is True
+    assert exit_codes == [0]
+
+
+def test_benign_engine_closed_warning_filter_is_narrow():
+    record = logging.LogRecord(
+        "livekit.agents", logging.WARNING, __file__, 1,
+        "engine: connection error: engine is closed", (), None,
+    )
+    assert _is_benign_engine_closed_warning(record) is True
+
+    error_record = logging.LogRecord(
+        "livekit.agents", logging.ERROR, __file__, 1,
+        "engine: connection error: engine is closed", (), None,
+    )
+    assert _is_benign_engine_closed_warning(error_record) is False
+
+    other_warning = logging.LogRecord(
+        "livekit.agents", logging.WARNING, __file__, 1,
+        "engine: connection error: websocket closed", (), None,
+    )
+    assert _is_benign_engine_closed_warning(other_warning) is False
+
+
+def test_get_sip_participant_phone_reads_sip_attribute():
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+        {"sip.phoneNumber": "+15551112222"},
+    )
+    assert _get_sip_participant_phone(participant) == "+15551112222"
+
+
+def test_get_sip_participant_phone_uses_attribute_regardless_of_kind():
+    """BYOC/Asterisk trunks may emit the SIP participant with a non-SIP kind.
+
+    The kind gate was removed in 2026-05; the helper now relies on attributes
+    and the `sip_<digits>` identity regex, both of which are specific enough
+    that false positives from non-SIP participants are not a real risk.
+    """
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
+        {"sip.phoneNumber": "+15551112222"},
+    )
+    assert _get_sip_participant_phone(participant) == "+15551112222"
+
+
+def test_get_sip_participant_phone_uses_identity_regardless_of_kind():
+    """Issue #9 regression: a STANDARD-kind participant whose identity is
+    `sip_<digits>` (Asterisk BYOC pattern) must still resolve to a phone."""
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
+        identity="sip_17135550038",
+    )
+    assert _get_sip_participant_phone(participant) == "+17135550038"
+
+
+def test_get_sip_participant_phone_prefers_explicit_sip_attribute():
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+        {"sip.phoneNumber": "+15551112222"},
+        "sip_17135550038",
+    )
+    assert _get_sip_participant_phone(participant) == "+15551112222"
+
+
+def test_get_sip_participant_phone_reads_sip_from_user():
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+        {"sip.fromUser": "17135550038"},
+    )
+    assert _get_sip_participant_phone(participant) == "+17135550038"
+
+
+def test_get_sip_participant_phone_reads_sip_from_uri():
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+        {"sip.from": "sip:+17135550038@pbx.example.com"},
+    )
+    assert _get_sip_participant_phone(participant) == "+17135550038"
+
+
+def test_get_sip_participant_phone_reads_sip_from_header_uri():
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+        {"sip.from": '"Keith" <sip:+17135550038@pbx.example.com>;tag=abc'},
+    )
+    assert _get_sip_participant_phone(participant) == "+17135550038"
+
+
+def test_get_sip_participant_phone_reads_sip_identity_fallback():
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+        identity="sip_17135550038",
+    )
+    assert _get_sip_participant_phone(participant) == "+17135550038"
+
+
+def test_get_sip_participant_phone_ignores_non_phone_identity():
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+        identity="sip_agent_smith",
+    )
+    assert _get_sip_participant_phone(participant) is None
+
+
+def test_get_sip_participant_phone_returns_none_for_irrelevant_participant():
+    """A non-SIP participant with no sip.* attributes and a non-SIP identity
+    must not produce a phone (no false positives from the relaxed kind gate)."""
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
+        attrs={"agent.state": "listening"},
+        identity="agent-12345",
+    )
+    assert _get_sip_participant_phone(participant) is None
+
+
+def test_capture_caller_phone_from_connected_sip_participant(v2_yaml):
+    from receptionist.config import BusinessConfig
+    config = BusinessConfig.from_yaml_string(v2_yaml)
+    lifecycle = CallLifecycle(config=config, call_id="room-abc", caller_phone=None)
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+        {"sip.phoneNumber": "+15551112222"},
+    )
+    _capture_caller_phone_from_participant(lifecycle, participant)
+    assert lifecycle.metadata.caller_phone == "+15551112222"
+
+
+def test_capture_caller_phone_from_sip_participant_without_phone_is_noop(v2_yaml):
+    from receptionist.config import BusinessConfig
+    config = BusinessConfig.from_yaml_string(v2_yaml)
+    lifecycle = CallLifecycle(config=config, call_id="room-abc", caller_phone=None)
+    participant = _participant(rtc.ParticipantKind.PARTICIPANT_KIND_SIP)
+    _capture_caller_phone_from_participant(lifecycle, participant)
+    assert lifecycle.metadata.caller_phone is None
+
+
+def test_capture_caller_phone_from_byoc_identity_only_participant(v2_yaml):
+    """Issue #9 regression: an Asterisk/BYOC participant with kind=STANDARD
+    and identity `sip_<digits>` must have its phone captured. The kind gate
+    was the silent-Unknown trap reported by @trinicomcom."""
+    from receptionist.config import BusinessConfig
+    config = BusinessConfig.from_yaml_string(v2_yaml)
+    lifecycle = CallLifecycle(config=config, call_id="room-abc", caller_phone=None)
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
+        identity="sip_17135550038",
+    )
+    _capture_caller_phone_from_participant(lifecycle, participant)
+    assert lifecycle.metadata.caller_phone == "+17135550038"
+
+
+def test_capture_caller_phone_logs_negative_result_at_info(caplog, v2_yaml):
+    """Issue #9: operators need a clear INFO log when CallerID can't be
+    resolved, so they can see what attributes/identity the SIP trunk
+    actually published without flipping debug flags."""
+    import logging
+
+    from receptionist.config import BusinessConfig
+    config = BusinessConfig.from_yaml_string(v2_yaml)
+    lifecycle = CallLifecycle(config=config, call_id="room-abc", caller_phone=None)
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_SIP,
+        attrs={"sip.callId": "abc-123"},
+        identity="sip_agent_smith",
+    )
+    with caplog.at_level(logging.INFO, logger="receptionist"):
+        _capture_caller_phone_from_participant(lifecycle, participant)
+    matched = [
+        r for r in caplog.records
+        if getattr(r, "component", None) == "agent.callerid"
+    ]
+    assert matched, "expected an agent.callerid INFO log record"
+    msg = matched[0].getMessage()
+    assert "no phone resolvable" in msg
+    assert "sip_agent_smith" in msg
+    # And the structured `extra` carries source/identity for log shippers
+    record = matched[0]
+    assert record.source == "snapshot"
+    assert record.participant_identity == "sip_agent_smith"
+
+
+def test_capture_caller_phone_logs_positive_result_at_info(caplog, v2_yaml):
+    import logging
+
+    from receptionist.config import BusinessConfig
+    config = BusinessConfig.from_yaml_string(v2_yaml)
+    lifecycle = CallLifecycle(config=config, call_id="room-abc", caller_phone=None)
+    participant = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
+        identity="sip_17135550038",
+    )
+    with caplog.at_level(logging.INFO, logger="receptionist"):
+        _capture_caller_phone_from_participant(
+            lifecycle, participant, source="participant_attributes_changed",
+        )
+    matched = [
+        r for r in caplog.records
+        if getattr(r, "component", None) == "agent.callerid"
+        and "captured caller phone" in r.getMessage()
+    ]
+    assert matched, "expected a successful capture INFO log record"
+    assert matched[0].source == "participant_attributes_changed"
+
+
+@pytest.mark.asyncio
+async def test_refresh_realtime_tools_pushes_full_agent_tool_list(caplog):
+    from unittest.mock import AsyncMock
+
+    tools = [
+        SimpleNamespace(id="take_message"),
+        SimpleNamespace(id="record_intake_answer"),
+        SimpleNamespace(id="finalize_intake"),
+    ]
+    receptionist = SimpleNamespace(tools=tools, update_tools=AsyncMock())
+    with caplog.at_level(logging.INFO, logger="receptionist"):
+        await _refresh_realtime_tools(receptionist, call_id="call-1")
+
+    receptionist.update_tools.assert_awaited_once_with(tools)
+    assert any(
+        "record_intake_answer" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_realtime_tools_logs_and_reraises_when_update_tools_fails(caplog):
+    """When `update_tools` raises (e.g. WebSocket reconnect, OpenAI Realtime
+    session still warming, transport blip), the failure must be visible in
+    the logs AND propagate so the call fails fast instead of running with
+    a phantom tool registry.
+
+    Silent swallowing was the root cause of multiple live-call regressions
+    where Riley called `record_intake_answer` and the model responded with
+    `Unknown function`; we want the next occurrence to leave a structured
+    log record we can grep for.
+    """
+    from unittest.mock import AsyncMock
+
+    tools = [SimpleNamespace(id="record_intake_answer")]
+    boom = RuntimeError("realtime session not ready")
+    receptionist = SimpleNamespace(
+        tools=tools, update_tools=AsyncMock(side_effect=boom),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="receptionist"):
+        with pytest.raises(RuntimeError, match="realtime session not ready"):
+            await _refresh_realtime_tools(receptionist, call_id="call-2")
+
+    error_records = [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR
+        and getattr(r, "component", None) == "agent.tools"
+        and getattr(r, "phase", None) == "update_tools"
+    ]
+    assert error_records, "expected a structured ERROR log for update_tools failure"
+    record = error_records[0]
+    assert record.call_id == "call-2"
+    # The tool list that we tried to push should be in the message so logs
+    # can confirm which tools were attempted.
+    assert "record_intake_answer" in record.getMessage()
+
+
+# ---- signaling warmup (cold-start mitigation) ----
+
+
+@pytest.mark.asyncio
+async def test_warm_signaling_calls_list_rooms_and_closes_client():
+    """The warmup must await a read-only RoomService call (to warm DNS/TLS to
+    the LiveKit host inside the job-runner subprocess) and always close the
+    client it created, so the warmup itself never leaks a connection.
+    """
+    from unittest.mock import AsyncMock
+
+    fake_client = SimpleNamespace(
+        room=SimpleNamespace(list_rooms=AsyncMock(return_value=SimpleNamespace(rooms=[]))),
+        aclose=AsyncMock(),
+    )
+    factory_calls = []
+
+    def factory():
+        factory_calls.append(True)
+        return fake_client
+
+    await agent_module._warm_signaling(api_factory=factory, timeout=2.0)
+
+    assert factory_calls, "expected the warmup to build an API client"
+    fake_client.room.list_rooms.assert_awaited_once()
+    fake_client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_warm_signaling_swallows_errors_and_logs(caplog):
+    """A warmup failure (no creds, network blip, host down) must NEVER raise —
+    it runs before the worker serves calls and must not block startup. It
+    should leave a WARNING so a persistently-failing warmup is greppable.
+    """
+    from unittest.mock import AsyncMock
+
+    fake_client = SimpleNamespace(
+        room=SimpleNamespace(list_rooms=AsyncMock(side_effect=RuntimeError("boom"))),
+        aclose=AsyncMock(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="receptionist"):
+        # Must return normally despite the inner error.
+        await agent_module._warm_signaling(api_factory=lambda: fake_client, timeout=2.0)
+
+    # Client still closed even on failure.
+    fake_client.aclose.assert_awaited_once()
+    assert any(
+        getattr(r, "component", None) == "agent.warmup"
+        for r in caplog.records
+    ), "expected a structured WARNING for the failed warmup"
+
+
+def test_prewarm_is_best_effort_and_never_raises(monkeypatch):
+    """`_prewarm` (wired to server.setup_fnc) runs per job-runner subprocess.
+    Even if the underlying warmup explodes, it must return without raising so
+    the subprocess can still accept jobs.
+    """
+    def boom(*args, **kwargs):
+        raise RuntimeError("warmup blew up")
+
+    monkeypatch.setattr(agent_module, "_warm_signaling", boom)
+    # Should not raise regardless of what _warm_signaling does.
+    agent_module._prewarm(SimpleNamespace(userdata={}))
+
+
+def test_tool_contract_raises_when_enabled_intake_tool_is_missing(caplog):
+    config = SimpleNamespace(
+        intakes=SimpleNamespace(enabled=True),
+        info_packets=SimpleNamespace(enabled=False),
+    )
+    receptionist = SimpleNamespace(
+        config=config,
+        tools=[SimpleNamespace(id="finalize_intake")],
+    )
+    verify = getattr(agent_module, "_verify_tool_contract", lambda *args, **kwargs: None)
+
+    with caplog.at_level(logging.ERROR, logger="receptionist"):
+        with pytest.raises(RuntimeError, match="missing required tools"):
+            verify(receptionist, call_id="call-1")
+
+    assert any("record_intake_answer" in record.getMessage() for record in caplog.records)
+
+
+def test_tool_contract_raises_when_enabled_info_packet_tool_is_missing(caplog):
+    config = SimpleNamespace(
+        intakes=SimpleNamespace(enabled=False),
+        info_packets=SimpleNamespace(enabled=True),
+    )
+    receptionist = SimpleNamespace(config=config, tools=[])
+    verify = getattr(agent_module, "_verify_tool_contract", lambda *args, **kwargs: None)
+
+    with caplog.at_level(logging.ERROR, logger="receptionist"):
+        with pytest.raises(RuntimeError, match="missing required tools"):
+            verify(receptionist, call_id="call-1")
+
+    assert any("send_info_packet" in record.getMessage() for record in caplog.records)
+
+
+# ---- _get_caller_identity / _get_caller_phone room-level tests ----
+
+
+def _ctx(*participants):
+    """Minimal JobContext stand-in: just exposes ctx.room.remote_participants."""
+    room = SimpleNamespace(
+        name="test-room",
+        remote_participants={p.identity or f"id-{i}": p for i, p in enumerate(participants)},
+    )
+    return SimpleNamespace(room=room)
+
+
+def test_get_caller_identity_prefers_sip_kind():
+    sip_p = _participant(rtc.ParticipantKind.PARTICIPANT_KIND_SIP, identity="sip_17135550038")
+    standard_p = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD, identity="sip_19998887777",
+    )
+    assert _get_caller_identity(_ctx(standard_p, sip_p)) == "sip_17135550038"
+
+
+def test_get_caller_identity_falls_back_to_byoc_identity_when_no_sip_kind():
+    """Issue #9: BYOC trunks may publish the SIP participant with a non-SIP kind.
+    Identity-based fallback keeps caller-identity resolution working."""
+    standard_p = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD, identity="sip_17135550038",
+    )
+    assert _get_caller_identity(_ctx(standard_p)) == "sip_17135550038"
+
+
+def test_get_caller_identity_returns_empty_when_no_sip_like_participant(caplog):
+    """Issue #9: the warning is preserved when nothing looks SIP-like; caller
+    identity becomes the empty string and downstream code knows to skip
+    SIP-specific operations."""
+    import logging
+
+    standard_p = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD, identity="agent-12345",
+    )
+    with caplog.at_level(logging.WARNING):
+        assert _get_caller_identity(_ctx(standard_p)) == ""
+    assert any("No SIP participant" in r.getMessage() for r in caplog.records)
+
+
+def test_get_caller_phone_uses_byoc_identity_when_attributes_missing():
+    """Issue #9 regression: phone resolves from a STANDARD-kind participant
+    whose identity is `sip_<digits>` (Asterisk/BYOC pattern)."""
+    standard_p = _participant(
+        rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD, identity="sip_17135550038",
+    )
+    assert _get_caller_phone(_ctx(standard_p)) == "+17135550038"
+
+
+# ---- _offered_slot_batches eviction tests (memory cap) ----
+
+def _bare_receptionist():
+    """Construct a Receptionist with the minimum scaffolding to exercise the
+    slot-cache helpers. Avoids the LiveKit Agent superclass init by
+    instantiating the helpers off a SimpleNamespace stand-in.
+    """
+    from collections import deque
+    from types import SimpleNamespace
+    from receptionist.agent import Receptionist
+    obj = SimpleNamespace()
+    obj._offered_slot_batches = deque(maxlen=3)
+    # Bind the methods to the namespace so we can call them directly
+    obj._record_offered_slots = Receptionist._record_offered_slots.__get__(obj)
+    obj._slot_was_offered = Receptionist._slot_was_offered.__get__(obj)
+    obj._reset_offered_slots = Receptionist._reset_offered_slots.__get__(obj)
+    return obj
+
+
+def test_offered_slots_basic_record_and_lookup():
+    r = _bare_receptionist()
+    r._record_offered_slots(["2026-04-28T10:00:00-04:00", "2026-04-28T11:00:00-04:00"])
+    assert r._slot_was_offered("2026-04-28T10:00:00-04:00")
+    assert r._slot_was_offered("2026-04-28T11:00:00-04:00")
+    assert not r._slot_was_offered("2026-04-28T15:00:00-04:00")
+
+
+def test_offered_slots_evicts_oldest_batch_after_three_check_availability_calls():
+    """deque(maxlen=3): the 4th batch evicts the 1st. Slots from the 1st
+    batch are no longer recognized; book_appointment would refuse them."""
+    r = _bare_receptionist()
+    r._record_offered_slots(["batch1-a", "batch1-b"])
+    r._record_offered_slots(["batch2-a", "batch2-b"])
+    r._record_offered_slots(["batch3-a"])
+    # 3 batches in cache, all still recognized
+    assert r._slot_was_offered("batch1-a")
+    assert r._slot_was_offered("batch2-a")
+    assert r._slot_was_offered("batch3-a")
+    # 4th batch evicts batch1
+    r._record_offered_slots(["batch4-a"])
+    assert not r._slot_was_offered("batch1-a")
+    assert not r._slot_was_offered("batch1-b")
+    assert r._slot_was_offered("batch2-a")  # still around
+    assert r._slot_was_offered("batch4-a")
+
+
+def test_offered_slots_reset_clears_and_seeds():
+    """After race recovery: reset wipes prior batches and seeds with the
+    fresh alternates only — old slots, even recent ones, are gone."""
+    r = _bare_receptionist()
+    r._record_offered_slots(["pre-1", "pre-2"])
+    r._record_offered_slots(["pre-3"])
+    r._reset_offered_slots(["fresh-a", "fresh-b"])
+    assert not r._slot_was_offered("pre-1")
+    assert not r._slot_was_offered("pre-3")
+    assert r._slot_was_offered("fresh-a")
+    assert r._slot_was_offered("fresh-b")
+
+
+def test_offered_slots_size_bounded_under_long_call():
+    """Memory cap regression: 100 batches must not grow the cache past 3."""
+    r = _bare_receptionist()
+    for i in range(100):
+        r._record_offered_slots([f"slot-{i}-{j}" for j in range(3)])
+    assert len(r._offered_slot_batches) == 3
+    # Only the last 3 batches are still queryable
+    assert r._slot_was_offered("slot-99-0")
+    assert r._slot_was_offered("slot-97-2")
+    assert not r._slot_was_offered("slot-50-0")
+    assert not r._slot_was_offered("slot-0-0")
+
+
+# ---- RealtimeModel kwargs builder + options (Task 10) ----
+
+from receptionist.config import VoiceConfig
+from receptionist.agent import (
+    _apply_realtime_options,
+    _build_realtime_model_kwargs,
+)
+
+
+def test_realtime_kwargs_minimal_when_features_unset():
+    voice = VoiceConfig(voice_id="marin", model="gpt-realtime-2.1-mini")
+    kwargs = _build_realtime_model_kwargs(voice, api_key="sk-test")
+    assert kwargs["model"] == "gpt-realtime-2.1-mini"
+    assert kwargs["voice"] == "marin"
+    assert kwargs["api_key"] == "sk-test"
+    assert "reasoning" not in kwargs
+    assert "max_response_output_tokens" not in kwargs
+
+
+def test_realtime_kwargs_includes_reasoning_when_set():
+    voice = VoiceConfig(
+        voice_id="marin", model="gpt-realtime-2.1", reasoning_effort="low",
+    )
+    kwargs = _build_realtime_model_kwargs(voice, api_key="sk-test")
+    assert kwargs["reasoning"].effort == "low"
+
+
+class _FakeRealtimeModelWithUpdate:
+    """Stand-in whose update_options accepts max_response_output_tokens."""
+
+    def __init__(self):
+        self.applied = {}
+
+    def update_options(self, *, max_response_output_tokens=None):
+        self.applied["max_response_output_tokens"] = max_response_output_tokens
+
+
+class _FakeRealtimeModelNoTokenSetter:
+    """update_options exists but doesn't accept the token kwarg."""
+
+    def __init__(self):
+        self.called = False
+
+    def update_options(self, *, voice=None):
+        self.called = True
+
+
+def test_apply_realtime_options_sets_token_cap_via_update_options():
+    voice = VoiceConfig(
+        voice_id="marin", model="gpt-realtime-2.1", max_response_output_tokens=1500,
+    )
+    model = _FakeRealtimeModelWithUpdate()
+    _apply_realtime_options(model, voice)
+    assert model.applied["max_response_output_tokens"] == 1500
+
+
+def test_apply_realtime_options_noop_when_cap_unset():
+    voice = VoiceConfig(voice_id="marin", model="gpt-realtime-2.1")
+    model = _FakeRealtimeModelWithUpdate()
+    _apply_realtime_options(model, voice)
+    assert model.applied == {}
+
+
+def test_apply_realtime_options_skips_when_setter_lacks_token_param(caplog):
+    voice = VoiceConfig(
+        voice_id="marin", model="gpt-realtime-2.1", max_response_output_tokens=1500,
+    )
+    model = _FakeRealtimeModelNoTokenSetter()
+    with caplog.at_level(logging.WARNING, logger="receptionist"):
+        _apply_realtime_options(model, voice)  # must not raise
+    assert model.called is False
+    assert any(
+        "max_response_output_tokens" in r.getMessage() and "NOT applied" in r.getMessage()
+        for r in caplog.records
+    ), "silently dropping the token cap must be surfaced as a WARNING"
+
+
+def test_apply_realtime_options_warns_when_update_options_missing(caplog):
+    voice = VoiceConfig(
+        voice_id="marin", model="gpt-realtime-2.1", max_response_output_tokens=1500,
+    )
+    with caplog.at_level(logging.WARNING, logger="receptionist"):
+        _apply_realtime_options(object(), voice)  # must not raise
+    assert any("NOT applied" in r.getMessage() for r in caplog.records)
+
+
+def test_trace_stage_logs_stage_and_call_id(caplog):
+    from receptionist.agent import _trace_stage
+
+    with caplog.at_level(logging.INFO, logger="receptionist"):
+        _trace_stage("about_to_session_start", "call-123")
+    rec = next(r for r in caplog.records if "stage=about_to_session_start" in r.getMessage())
+    assert rec.call_id == "call-123"
+
+
+# ---- Realtime error recovery: filler + retry (Task 11) ----
+
+import asyncio as _asyncio
+from receptionist.agent import _RealtimeRecovery
+
+
+class _FakeSession:
+    def __init__(self):
+        self.said = []
+        self.say_kwargs = []
+        self.generate_reply_calls = 0
+
+    def say(self, text, **kwargs):
+        self.said.append(text)
+        self.say_kwargs.append(kwargs)
+        return SimpleNamespace()
+
+    def generate_reply(self, **kwargs):
+        self.generate_reply_calls += 1
+        return SimpleNamespace()
+
+
+def _err_event(label="realtime", message="response failed: [tokens] rate_limit_exceeded",
+               recoverable=True):
+    return SimpleNamespace(
+        error=SimpleNamespace(label=label, error=Exception(message), recoverable=recoverable),
+    )
+
+
+def test_recovery_speaks_filler_and_retries_on_recoverable_error():
+    sess = _FakeSession()
+    rec = _RealtimeRecovery(sess, filler_text="One moment.", backoff_seconds=0.0)
+
+    async def run():
+        await rec.handle_error(_err_event())
+
+    _asyncio.run(run())
+    assert sess.said == ["One moment."]
+    assert sess.generate_reply_calls == 1
+    # Filler must not pollute the chat context (it would be re-billed every
+    # turn on a speech-to-speech model — ironic on the token-rate problem).
+    assert sess.say_kwargs[0].get("add_to_chat_ctx") is False
+
+
+def test_recovery_caps_retries_per_call():
+    """A sustained realtime failure must not loop forever: after the per-call
+    cap, the handler stops auto-recovering even on fresh recoverable errors."""
+    sess = _FakeSession()
+    rec = _RealtimeRecovery(
+        sess, filler_text="One moment.", backoff_seconds=0.0, max_recoveries=2,
+    )
+
+    async def run():
+        for _ in range(5):
+            await rec.handle_error(_err_event())
+
+    _asyncio.run(run())
+    assert sess.generate_reply_calls == 2
+    assert sess.said == ["One moment.", "One moment."]
+
+
+def test_recovery_ignores_non_recoverable_error():
+    sess = _FakeSession()
+    rec = _RealtimeRecovery(sess, filler_text="One moment.", backoff_seconds=0.0)
+
+    async def run():
+        await rec.handle_error(_err_event(recoverable=False))
+
+    _asyncio.run(run())
+    assert sess.said == []
+    assert sess.generate_reply_calls == 0
+
+
+def test_recovery_dedups_concurrent_errors_to_one_retry():
+    sess = _FakeSession()
+    rec = _RealtimeRecovery(sess, filler_text="One moment.", backoff_seconds=0.02)
+
+    async def run():
+        await _asyncio.gather(
+            rec.handle_error(_err_event()),
+            rec.handle_error(_err_event()),
+            rec.handle_error(_err_event()),
+        )
+
+    _asyncio.run(run())
+    # Only one in-flight recovery should run; the others are suppressed.
+    assert sess.generate_reply_calls == 1
+    assert sess.said == ["One moment."]
+
+
+def test_recovery_disabled_with_empty_filler_still_retries():
+    sess = _FakeSession()
+    rec = _RealtimeRecovery(sess, filler_text="", backoff_seconds=0.0)
+
+    async def run():
+        await rec.handle_error(_err_event())
+
+    _asyncio.run(run())
+    assert sess.said == []  # no filler when text is empty
+    assert sess.generate_reply_calls == 1
+
+
+def test_recovery_never_raises_when_session_methods_fail():
+    class _BoomSession:
+        def say(self, *a, **k):
+            raise RuntimeError("say boom")
+
+        def generate_reply(self, *a, **k):
+            raise RuntimeError("reply boom")
+
+    rec = _RealtimeRecovery(_BoomSession(), filler_text="One moment.", backoff_seconds=0.0)
+
+    async def run():
+        await rec.handle_error(_err_event())  # must not raise
+
+    _asyncio.run(run())
+
+
+def test_create_realtime_model_openai_default():
+    from receptionist.agent import _create_realtime_model
+    from livekit.plugins import openai
+
+    voice = VoiceConfig(voice_id="marin", model="gpt-realtime-2.1")
+    model = _create_realtime_model(voice, api_key="sk-test")
+    assert isinstance(model, openai.realtime.RealtimeModel)
+
+
+def test_create_realtime_model_google_provider(monkeypatch):
+    from receptionist.agent import _create_realtime_model
+    from livekit.plugins import google
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    voice = VoiceConfig(provider="google", voice_id="Aoede", model="gemini-2.5-flash-native-audio-preview-12-2025")
+    model = _create_realtime_model(voice, api_key=None)
+    assert isinstance(model, google.realtime.RealtimeModel)
+    assert model._opts.voice == "Aoede"
+    assert model._opts.api_key == "test-gemini-key"
+
+
+def test_create_realtime_model_google_gemini_prefix(monkeypatch):
+    from receptionist.agent import _create_realtime_model
+    from livekit.plugins import google
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+    voice = VoiceConfig(model="gemini-2.0-flash-exp")
+    model = _create_realtime_model(voice, api_key=None)
+    assert isinstance(model, google.realtime.RealtimeModel)
+    assert model._opts.voice == "Aoede"
+    assert model._opts.api_key == "test-google-key"
+
+

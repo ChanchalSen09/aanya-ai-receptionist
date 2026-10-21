@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+HANDOFF.md
+# Internal design specs, implementation plans, and superpowers workflow
+# artifacts. Operator-local; not part of the public-facing documentation
+# in `documentation/`. Keep on disk for development history.
+docs/
+CLAUDE.md
+.env
+.env.local
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+messages/
+transcripts/
+documentation/
+recordings/
+.worktrees/
+.pytest_cache/
+*.log
+logs/
+KMS/
+
+# Private per-business configs — only the public `example-*.yaml` templates
+# are tracked. Any other YAML in config/businesses/ is operator-local.
+config/businesses/*.yaml
+!config/businesses/example-*.yaml
+
+# Per-business calendar credentials (service-account keys, OAuth tokens, OAuth client JSON)
+secrets/*
+!secrets/.gitkeep
+
+# Local-only VM provisioning scripts (reference the tenant slug; not for the public repo)
+deploy/
