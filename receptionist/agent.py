@@ -197,7 +197,7 @@ def _create_realtime_model(
         model_name = (
             voice_config.model
             if voice_config.model.startswith("gemini")
-            else "gemini-2.5-flash-native-audio-preview-12-2025"
+            else "gemini-3.8-live"
         )
         # Calibrate input audio transcription for Hindi and Indian English accents
         transcription_kwargs: dict = {
@@ -213,7 +213,18 @@ def _create_realtime_model(
             "temperature": 0.25,  # Low temperature for strict factual accuracy
             "input_audio_transcription": transcription_cfg,
             "output_audio_transcription": types.AudioTranscriptionConfig(),
+            # Fast turn detection: 350ms silence threshold for snappy turn-taking
+            "realtime_input_config": types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    silence_duration_ms=350,
+                    prefix_padding_ms=80,
+                )
+            ),
         }
+        # On gemini-3.8-live, omit thinking_config (suppressing thinking headers yields ~600ms latency)
+        # On older preview models, explicitly set thinking_budget=0 to prevent multi-second reasoning delays
+        if "3.8" not in model_name:
+            kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
         if key:
             kwargs["api_key"] = key
         if voice_config.max_response_output_tokens:
@@ -2585,6 +2596,13 @@ async def handle_call(ctx: agents.JobContext):
         # built-in user-state machine. When the caller falls silent for this
         # long, `user_state` flips to "away" and we start the grace timer.
         user_away_timeout=idle_cfg.away_seconds,
+        turn_handling={
+            "turn_detection": "realtime_llm",
+            "endpointing": {
+                "min_delay": 0.1,
+                "max_delay": 0.4,
+            },
+        },
     )
 
     # Wire transcript capture BEFORE session starts so no events are missed.
@@ -2834,7 +2852,7 @@ async def handle_call(ctx: agents.JobContext):
                 noise_cancellation=lambda params: (
                     noise_cancellation.BVCTelephony()
                     if params.participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP
-                    else noise_cancellation.BVC()
+                    else None
                 ),
             ),
         ),
