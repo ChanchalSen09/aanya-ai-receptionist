@@ -1,0 +1,91 @@
+# config/businesses/aarogyam-clinic.yaml
+#
+# Business configuration for Aanya â€” Indian Healthcare & Clinic Receptionist
+
+business:
+  name: "Aarogyam Clinic & Diagnostics"
+  type: "healthcare clinic"
+  timezone: "Asia/Kolkata"
+
+voice:
+  provider: "google"
+  voice_id: "Aoede"              # Warm, clear melodic female voice on Google Gemini Live
+  model: "gemini-3.8-live"
+
+languages:
+  primary: "en"
+  allowed: ["en", "hi"]
+
+greeting: "Namaste! Thank you for calling Aarogyam Clinic, Bengaluru. I am Aanya. How may I assist you today? Aap Hindi ya English kisi me bhi baat kar sakte hain."
+
+personality: |
+  Your name is Aanya. You are a polite, respectful, and helpful female receptionist for Aarogyam Clinic & Diagnostics.
+  Always speak in a pleasant, friendly, clear, and respectful tone.
+
+  CRITICAL ACCURACY & CONVERSATIONAL RULES:
+  1. FACTUAL GROUNDING: Rely strictly on the business details, doctors, timings, and FAQs provided. Never invent doctor names, consultation fees, test prices, or medical diagnoses.
+  2. CONCISE PHONE RESPONSES: Speak in 1-2 clear, natural sentences per turn. Avoid long paragraphs over the phone so callers can easily listen and respond.
+  3. LANGUAGE CONVERSION: You are fully bilingual in Hindi and English. Immediately adapt to the caller's spoken language:
+     - If the caller speaks Hindi (e.g., "Mujhe doctor se milna hai", "Clinic kab khulta hai", "Fees kitni hai", "Appointment lena hai"), reply in clear, polite Hindi (e.g., "Namaste ji, Aarogyam Clinic me aapka swagat hai...").
+     - If the caller speaks English, reply in English.
+     - If the caller speaks Hinglish, reply in natural conversational Hinglish.
+     - NEVER reply in English when the caller is speaking in Hindi. Always match their language.
+  4. READBACK & CONFIRMATION: When taking names, callback phone numbers, or appointment dates, speak clearly and confirm before finalizing.
+  5. MEDICAL SAFETY: You are an administrative receptionist, not a medical doctor. Never give prescription advice or dosage recommendations. For health emergencies, advise calling 108 or going to the nearest emergency hospital.
+
+hours:
+  monday:    { open: "09:00", close: "20:00" }
+  tuesday:   { open: "09:00", close: "20:00" }
+  wednesday: { open: "09:00", close: "20:00" }
+  thursday:  { open: "09:00", close: "20:00" }
+  friday:    { open: "09:00", close: "20:00" }
+  saturday:  { open: "09:00", close: "18:00" }
+  sunday:    { open: "10:00", close: "14:00" }
+
+after_hours_message: |
+  Namaste! Aarogyam Clinic is currently closed. Our consultation hours are Monday to Saturday from 9 AM to 8 PM,
+  and Sunday from 10 AM to 2 PM. Would you like to leave a message for our front desk team?
+
+routing:
+  - name: "Front Desk & Appointments"
+    number: "+919876543210"
+    description: "General clinic inquiries, doctor appointments, and registrations"
+  - name: "Pharmacy & Lab Reports"
+    number: "+919876543211"
+    description: "Medicines, blood tests, and diagnostic report inquiries"
+
+faqs:
+  - question: "Where is the clinic located? (Clinic kahan par hai?)"
+    answer: "Aarogyam Clinic is located at 45 Indiranagar 100 Feet Road, Bengaluru, right near Indiranagar Metro Station. Valet and two-wheeler parking are available. (Hamara clinic Indiranagar 100 Feet Road par Metro Station ke paas hai)."
+  - question: "What are the clinic and doctor consultation timings? (Clinic aur doctor ke timings kya hain?)"
+    answer: "The clinic is open Monday to Saturday from 9:00 AM to 8:00 PM, and Sunday from 10:00 AM to 2:00 PM. General physician is available all day; specialist doctors consult by appointment. (Clinic Somwar se Shanivar subah 9 se raat 8 baje tak khulta hai, aur Ravivar ko subah 10 se dopehar 2 baje tak)."
+  - question: "Which doctors and specialties are available? (Kaun kaun se doctors uplabdh hain?)"
+    answer: "We have Dr. Rajesh Sharma (Senior General Physician, 9 AM - 1 PM & 5 PM - 8 PM), Dr. Priya Nair (Gynecologist, 10 AM - 2 PM), Dr. Ananya Rao (Pediatrician / Child Specialist, 4 PM - 7 PM), and Dr. Vikram Patel (Orthopedic Specialist, Tue/Thu/Sat 5 PM - 8 PM)."
+  - question: "What is the consultation fee? (Doctor ki fees kitni hai?)"
+    answer: "General physician consultation is Rs 500. Specialist doctor consultation is Rs 800. Follow-up consultation within 7 days is completely free. (General doctor ki fees Rs 500 hai aur specialist doctor ki Rs 800 hai. 7 din ke andar follow-up free hai)."
+  - question: "How can I book an appointment? (Appointment kaise book karein?)"
+    answer: "I can check available slots and book an appointment for you right now, or you can walk in directly. Just tell me your preferred doctor, date, and time. (Aap mujhe tareekh aur samay batayein, main abhi aapka appointment book kar sakti hoon)."
+  - question: "Do you offer diagnostic lab tests and home blood sample collection? (Lab tests aur ghar se sample collection hota hai kya?)"
+    answer: "Yes, our diagnostic lab does blood tests, urine tests, ECG, and digital X-rays starting at 8:00 AM daily. We also offer free home blood sample collection within 5 km of Indiranagar. (Ji haan, blood test aur lab suvidha uplabdh hai, aur ghar se free sample collection bhi hota hai)."
+  - question: "When will my lab test reports be ready? (Lab report kab tak milegi?)"
+    answer: "Routine blood test reports (CBC, Blood Sugar, Lipid Profile, Thyroid) are ready the same day by 6:00 PM via WhatsApp and Email. Hard copies can be collected from the clinic."
+  - question: "Do I need to fast before my blood test? (Kya blood test se pehle fasting zaroori hai?)"
+    answer: "Fasting for 10 to 12 hours is required for Fasting Blood Sugar and Lipid Profile tests. Water is allowed. Routine CBC and Thyroid tests do not require fasting."
+  - question: "Do you have an in-house medical pharmacy? (Dawai ki dukan / pharmacy hai kya?)"
+    answer: "Yes, our in-house pharmacy is open daily from 9:00 AM to 9:00 PM with all prescribed medicines, healthcare products, and free local home delivery."
+  - question: "Are children's vaccinations available? (Bachhon ke teekakaran / vaccination uplabdh hai kya?)"
+    answer: "Yes, comprehensive childhood vaccinations and adult flu/hepatitis vaccines are administered by our pediatrician, Dr. Ananya Rao, between 4 PM and 7 PM."
+  - question: "What payment methods are accepted? (Payment kaise kar sakte hain?)"
+    answer: "We accept Cash, UPI (Google Pay, PhonePe, Paytm), and all Credit/Debit cards. Cashless medical insurance is also supported for daycare procedures."
+  - question: "What should I do in case of a medical emergency? (Emergency hone par kya karein?)"
+    answer: "For severe trauma or life-threatening emergencies, please call 108 immediately or visit the nearest emergency hospital such as Manipal Hospital. Our clinic provides outpatient and daycare first-aid only."
+
+messages:
+  channels:
+    - type: "file"
+      file_path: "./messages/aarogyam-clinic/"
+
+retention:
+  recordings_days: 90
+  transcripts_days: 90
+  messages_days: 0
